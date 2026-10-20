@@ -1033,12 +1033,3 @@ func main() {
 	go ms.run()
 	runSplitter(cfg, rl)
 }
-package main
-
-import (
-    "crypto/tls"
-    "encoding/base64"
-    "encoding/json"
-    "log"
-    "os"
-)
