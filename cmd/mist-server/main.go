@@ -1011,6 +1011,15 @@ func main() {
 		MinVersion:   tls.VersionTLS13,
 		MaxVersion:   tls.VersionTLS13,
 	}
+	// ECH: load keys if available (RFC 9849)
+	if echKeys := loadECHKeys("/opt/mist/ech-keys.json"); echKeys != nil {
+		tlsCfg.EncryptedClientHelloKeys = []tls.EncryptedClientHelloKey{{
+			Config:      echKeys.Config,
+			PrivateKey:  echKeys.PrivateKey,
+			SendAsRetry: true,
+		}}
+		log.Printf("ECH enabled (public_name=%s)", echKeys.PublicName)
+	}
 
 	rl := newRateLimiter(cfg.MaxConnsPerIP, cfg.NewConnsPerMin)
 	ms := &mistService{
@@ -1024,3 +1033,12 @@ func main() {
 	go ms.run()
 	runSplitter(cfg, rl)
 }
+package main
+
+import (
+    "crypto/tls"
+    "encoding/base64"
+    "encoding/json"
+    "log"
+    "os"
+)
