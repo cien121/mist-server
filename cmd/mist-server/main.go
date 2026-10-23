@@ -12,6 +12,8 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	crand "crypto/rand"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -40,6 +42,7 @@ import (
 
 type Config struct {
 	Listen         string            `json:"listen"`
+	UDPListen      string            `json:"udp_listen"`
 	MistDomain     string            `json:"mist_domain"`
 	MistBackend    string            `json:"mist_backend"`
 	Routes         map[string]string `json:"routes"`
@@ -58,6 +61,7 @@ type Config struct {
 func defaultConfig() *Config {
 	return &Config{
 		Listen:         "0.0.0.0:1443",
+		UDPListen:      "0.0.0.0:1443",
 		MistDomain:     "mist.lab",
 		MistBackend:    "127.0.0.1:14431",
 		Routes:         map[string]string{"other.example.com": "127.0.0.1:14430"},
@@ -400,6 +404,275 @@ func ephemeralCert(sans []string) (tls.Certificate, error) {
 		return tls.Certificate{}, err
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}, nil
+}
+
+// ---------------------------------------------------------------------------
+// UDP server (Mist UDP transport, Phase 1)
+// ---------------------------------------------------------------------------
+
+// udpServer holds state for the Mist UDP server.
+type udpServer struct {
+	cfg      *Config
+	accounts map[[16]byte][32]byte
+	codec    mistcore.InitialCodec
+	sessions map[[16]byte]*mistcore.UDPSession // sessionID -> session
+	mu       sync.RWMutex
+	conn     *net.UDPConn
+	// OnUnknownDCID is the h3 fallback hook (Phase 2, §9.1).
+	// Called when a short-header packet arrives with an unknown DCID.
+	// Phase 4 will implement: forward to real h3 backend by source address
+	// (requires per-source forwarding table; h3 backend needs the SNI cert).
+	// For now, nil = silent drop (Phase 1 behavior).
+	OnUnknownDCID func(pkt []byte, clientAddr *net.UDPAddr)
+}
+
+// runUDPServer starts the Mist UDP server.
+// Listens on cfg.UDPListen (default 0.0.0.0:1443).
+// Handles Initial handshake and data packets (Phase 1: basic, no BBR/reliability).
+func runUDPServer(cfg *Config, accounts map[[16]byte][32]byte) {
+	addr, err := net.ResolveUDPAddr("udp", cfg.UDPListen)
+	if err != nil {
+		log.Fatalf("udp resolve %s: %v", cfg.UDPListen, err)
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		log.Fatalf("udp listen %s: %v", cfg.UDPListen, err)
+	}
+	log.Printf("mist udp listening on %s", cfg.UDPListen)
+
+	srv := &udpServer{
+		cfg:      cfg,
+		accounts: accounts,
+		codec:    &mistcore.RandomCiphertextCodec{},
+		sessions: make(map[[16]byte]*mistcore.UDPSession),
+		conn:     conn,
+	}
+
+	// Safety gate (2026-10-23 review): the Phase 1 random-ciphertext Initial
+	// is a DPI fingerprint and must never run on a public network. Refuse to
+	// start if the listen address is not loopback/private. This runs before
+	// binding so a bad config fails loudly at startup, not silently later.
+	if err := mistcore.CheckInitialCodecSafeForAddr(srv.codec, cfg.UDPListen); err != nil {
+		log.Printf("FATAL: UDP 安全门拒绝启动")
+		log.Printf("原因: %v", err)
+		log.Printf("解除方式: (1) 内测请把 udp_listen 改为 127.0.0.1:1443 这类内网地址, " +
+			"并用 -tags mist_unsafe_initial 构建; " +
+			"(2) 公网部署请等待 Phase 0,换成真 QUIC Initial 实现 (QUICInitialCodec)")
+		log.Fatalf("udp safety gate: startup refused")
+	}
+
+	// Session cleanup goroutine (idle timeout 5 minutes).
+	go srv.cleanupLoop()
+
+	// ACK flush goroutine: the reliability layer only emits ACKs on packet
+	// receipt (every 10 packets or 10ms elapsed, checked lazily). Without a
+	// periodic flush, the tail of a burst (<10 packets) would never be ACKed
+	// until more traffic arrives, and the client's RTO (~RTT on fast paths)
+	// would fire spuriously for it. Flush every 10ms to bound ACK delay.
+	go srv.ackFlushLoop()
+
+	buf := make([]byte, 65535)
+	for {
+		n, clientAddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			log.Printf("udp read: %v", err)
+			continue
+		}
+		// Copy packet (buf is reused).
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		go srv.handlePacket(pkt, clientAddr)
+	}
+}
+
+// cleanupLoop removes idle sessions.
+func (s *udpServer) cleanupLoop() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.mu.Lock()
+		now := time.Now()
+		for id, sess := range s.sessions {
+			// Idle timeout: 5 minutes.
+			if now.Sub(sess.LastActive) > 5*time.Minute {
+				delete(s.sessions, id)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+// ackFlushLoop periodically flushes pending ACKs on all sessions.
+// Snapshot under RLock, flush outside the lock (FlushAck's callback writes
+// to the socket and must not run while holding the sessions lock).
+func (s *udpServer) ackFlushLoop() {
+	ticker := time.NewTicker(mistcore.UDPAckTimeout)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.mu.RLock()
+		sessList := make([]*mistcore.UDPSession, 0, len(s.sessions))
+		for _, sess := range s.sessions {
+			sessList = append(sessList, sess)
+		}
+		s.mu.RUnlock()
+		for _, sess := range sessList {
+			sess.Rel.FlushAck()
+		}
+	}
+}
+
+// handlePacket processes a single UDP datagram.
+func (s *udpServer) handlePacket(pkt []byte, clientAddr *net.UDPAddr) {
+	if len(pkt) < 1 {
+		return
+	}
+	// Check packet type: long header (Initial) vs short header (data).
+	// Long header: bits 0-1 = 0b11. Short header: bits 0-1 = 0b01.
+	if pkt[0]&0xC0 == 0xC0 {
+		s.handleInitial(pkt, clientAddr)
+	} else if pkt[0]&0xC0 == 0x40 {
+		s.handleData(pkt, clientAddr)
+	}
+	// else: not a QUIC packet, ignore (silent).
+}
+
+// handleInitial processes a QUIC Initial packet (handshake).
+func (s *udpServer) handleInitial(pkt []byte, clientAddr *net.UDPAddr) {
+	// Lookup function for HANDSHAKE_CID.
+	// Per UDP-DESIGN.md §5.1: HANDSHAKE_CID = HMAC-SHA256(K_auth, NONCE)[0:16].
+	lookup := func(handshakeCID [16]byte, nonce [24]byte) (*[32]byte, [16]byte, bool) {
+		for cid, kAuth := range s.accounts {
+			mac := hmac.New(sha256.New, kAuth[:])
+			mac.Write(nonce[:])
+			sum := mac.Sum(nil)
+			var expected [16]byte
+			copy(expected[:], sum[:16])
+			if expected == handshakeCID {
+				ka := new([32]byte)
+				*ka = kAuth
+				return ka, cid, true
+			}
+		}
+		return nil, [16]byte{}, false
+	}
+
+	result, err := mistcore.UDPServerHandshake(s.codec, pkt, clientAddr, lookup)
+	if err != nil {
+		// Silent on failure (anti-probing).
+		return
+	}
+
+	// Wire reliability callbacks for the data path (lab echo):
+	// - OnAckNeeded: ACK received packets so the peer's RTO doesn't fire
+	//   spuriously. ACKs go untracked (never ACKed themselves).
+	// - OnRetransmit: resend our own lost packets with new packet numbers.
+	sess := result.Session
+	sess.Rel.OnAckNeeded = func(largest uint32, ranges [][2]uint32, ackDelay time.Duration) {
+		ack := mistcore.EncodeAckFrame(0, largest, ackDelay, ranges)
+		resp, err := sess.SealPacketUntracked(mistcore.DirS2C, [][]byte{ack})
+		if err == nil {
+			s.conn.WriteToUDP(resp, sess.RemoteAddr)
+		}
+	}
+	sess.Rel.OnRetransmit = func(frames [][]byte) {
+		resp, err := sess.SealPacket(mistcore.DirS2C, frames)
+		if err == nil {
+			s.conn.WriteToUDP(resp, sess.RemoteAddr)
+		}
+	}
+
+	// Store session.
+	s.mu.Lock()
+	s.sessions[result.Session.SessionID] = result.Session
+	s.mu.Unlock()
+
+	// Send AUTH_OK response.
+	_, err = s.conn.WriteToUDP(result.Response, clientAddr)
+	if err != nil {
+		log.Printf("udp write AUTH_OK: %v", err)
+	}
+}
+
+// handleData processes a QUIC short header packet (data).
+func (s *udpServer) handleData(pkt []byte, clientAddr *net.UDPAddr) {
+	if len(pkt) < mistcore.QUICShortHeaderLen {
+		return
+	}
+	// Extract DCID (bytes 1-8) to find session.
+	var dcid [8]byte
+	copy(dcid[:], pkt[1:9])
+
+	// Find session by DCID (first 8 bytes of session ID).
+	s.mu.RLock()
+	var session *mistcore.UDPSession
+	for _, sess := range s.sessions {
+		if sess.SessionID8() == dcid {
+			session = sess
+			break
+		}
+	}
+	s.mu.RUnlock()
+
+	if session == nil {
+		// Unknown DCID: h3 fallback hook (Phase 2, §9.1).
+		// Phase 4 will forward to real h3 backend here.
+		if s.OnUnknownDCID != nil {
+			s.OnUnknownDCID(pkt, clientAddr)
+		}
+		return // Silent drop if no hook.
+	}
+
+	// Update remote address (for migration).
+	// For Phase 1: just update it directly (no PATH_CHALLENGE yet).
+	// Phase 2 will add proper path validation.
+	session.RemoteAddr = clientAddr
+
+	// Decrypt and process frames.
+	// Direction: client → server.
+	frames, _, err := session.OpenPacket(mistcore.DirC2S, pkt)
+	if err != nil {
+		return // Decrypt failed, silent drop.
+	}
+
+	// Phase 1: basic frame handling.
+	// For now, just acknowledge receipt by updating last-active.
+	// Full proxy logic (CONNECT, STREAM routing) will be added in Phase 3
+	// when the Xray client is implemented.
+	for _, f := range frames {
+		switch f.Type {
+		case mistcore.UDPFramePing:
+			// For testing: if we receive a PING, send back a PONG.
+			pong := mistcore.EncodeUDPFrame(mistcore.UDPFramePong, 0, nil)
+			resp, err := session.SealPacket(mistcore.DirS2C, [][]byte{pong})
+			if err == nil {
+				s.conn.WriteToUDP(resp, clientAddr)
+			}
+		case mistcore.UDPFrameAck:
+			// Process peer ACKs so our tracked sent-packets get cleared
+			// (prevents spurious RTO retransmits of echoes).
+			largest, ackDelay, ranges, err := mistcore.DecodeAckFrame(f.Payload)
+			if err == nil {
+				session.Rel.ProcessAck(largest, ackDelay, ranges)
+			}
+		case mistcore.UDPFrameStream:
+			// Lab echo (mist-udp-test): reflect the STREAM frame back
+			// verbatim (same SID, offset, data).
+			echo := mistcore.EncodeUDPFrame(mistcore.UDPFrameStream, f.SID, f.Payload)
+			resp, err := session.SealPacket(mistcore.DirS2C, [][]byte{echo})
+			if err == nil {
+				s.conn.WriteToUDP(resp, clientAddr)
+			}
+		case mistcore.UDPFrameSyn:
+			// Stream open noted; no reply needed in echo mode.
+		case mistcore.UDPFrameFin:
+			// Echo FIN back (same SID, FINAL_SIZE) for a clean close.
+			echo := mistcore.EncodeUDPFrame(mistcore.UDPFrameFin, f.SID, f.Payload)
+			resp, err := session.SealPacket(mistcore.DirS2C, [][]byte{echo})
+			if err == nil {
+				s.conn.WriteToUDP(resp, clientAddr)
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -975,9 +1248,20 @@ func (m *mistService) udpReadLoop(ss *serverSession, st *mistcore.Stream, uc *ne
 // main
 // ---------------------------------------------------------------------------
 
+// buildCommit is stamped at build time via -ldflags "-X main.buildCommit=<sha>".
+// 联调基线: mist-udp-pre-integration (xray-core ccc73db8).
+var buildCommit = "dev"
+
 func main() {
 	cfgPath := flag.String("config", "", "path to JSON config (default: built-in lab defaults)")
+	showVersion := flag.Bool("version", false, "print build commit and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("mist-server build %s\n", buildCommit)
+		os.Exit(0)
+	}
+	log.Printf("mist-server starting (build %s)", buildCommit)
 
 	cfg := loadConfig(*cfgPath)
 	accounts := loadAccounts(cfg.Accounts)
@@ -1031,5 +1315,9 @@ func main() {
 		go runDummy(cfg.DummyListen)
 	}
 	go ms.run()
+	// UDP server for Mist UDP transport (Phase 1).
+	if cfg.UDPListen != "" {
+		go runUDPServer(cfg, accounts)
+	}
 	runSplitter(cfg, rl)
 }

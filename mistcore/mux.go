@@ -382,19 +382,30 @@ func NewSession(p SessionParams) *Session {
 }
 
 // writeFrame encrypts and sends one frame (shaping applied).
+// The shaper Delay() sleep happens BEFORE acquiring sendMu, so concurrent
+// streams don't block each other during the (up to 15ms) shaping delay.
+// sendMu still serializes counter increment + encrypt + TCP write to keep
+// nonces unique and frames in counter order on the wire.
 func (s *Session) writeFrame(sidFlags byte, flags byte, plaintext []byte) error {
 	select {
 	case <-s.closed:
 		return io.ErrClosedPipe
 	default:
 	}
+
+	// Shaping delay outside the send lock: it's just a sleep, no shared
+	// state that needs sendMu. This lets multiple streams delay in parallel
+	// instead of serializing on the global lock.
+	if s.shaper != nil {
+		s.shaper.Delay()
+	}
+
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 
 	var pad int
 	if s.shaper != nil {
 		pad = s.shaper.PadLen()
-		s.shaper.Delay()
 	}
 	enc, err := EncodeFrame(sidFlags|flags, plaintext, pad, &s.encKey, s.epoch, s.encDir, s.sendCtr)
 	if err != nil {
