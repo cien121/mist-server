@@ -1175,13 +1175,30 @@ func (m *mistService) dialAndPipe(ss *serverSession, st *mistcore.Stream, atyp b
 // UDP relay (SPEC 9.4, v0.1 basic)
 // ---------------------------------------------------------------------------
 
+// tagRelay is one per-tag UDP upstream: responses arriving on its conn
+// belong to that tag by construction, so same-target sessions on one
+// bearer stream can no longer cross-talk.
+type tagRelay struct {
+	conn   *net.UDPConn
+	target string
+}
+
 func (m *mistService) relayUDP(ss *serverSession, st *mistcore.Stream) {
 	defer st.Close()
-	var uc *net.UDPConn
+	var uc *net.UDPConn // tag==0 legacy path: single conn, target switch closes it
+	// tag!=0 path: one conn per tag, guarded by tagMu (relay loop and
+	// every read loop touch this map).
+	tagged := make(map[uint8]*tagRelay)
+	var tagMu sync.Mutex
 	defer func() {
 		if uc != nil {
 			uc.Close()
 		}
+		tagMu.Lock()
+		for _, tr := range tagged {
+			tr.conn.Close()
+		}
+		tagMu.Unlock()
 	}()
 	var curTarget string
 	for {
@@ -1190,7 +1207,7 @@ func (m *mistService) relayUDP(ss *serverSession, st *mistcore.Stream) {
 			return
 		}
 		ss.touch()
-		atyp, addr, port, data, err := mistcore.DecodeDatagram(dg)
+		atyp, addr, port, data, tag, err := mistcore.DecodeDatagramTagged(dg)
 		if err != nil {
 			continue
 		}
@@ -1198,24 +1215,65 @@ func (m *mistService) relayUDP(ss *serverSession, st *mistcore.Stream) {
 		if target == "" {
 			continue
 		}
-		if uc == nil || target != curTarget {
-			if uc != nil {
-				uc.Close()
+		if tag == 0 {
+			// Legacy path, byte-for-byte the old behaviour: one conn,
+			// closed and re-dialled when the target changes. Known
+			// defect, kept for old clients: same-target sessions on
+			// this bearer still share this conn and may cross-talk.
+			if uc == nil || target != curTarget {
+				if uc != nil {
+					uc.Close()
+				}
+				raddr, err := net.ResolveUDPAddr("udp", target)
+				if err != nil {
+					continue
+				}
+				uc, err = net.DialUDP("udp", nil, raddr)
+				if err != nil {
+					uc = nil
+					continue
+				}
+				curTarget = target
+				go m.udpReadLoop(ss, st, uc)
+			}
+			uc.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := uc.Write(data); err != nil {
+				return
+			}
+			continue
+		}
+		// Tagged path: per-tag conn, re-dialled only when this tag's
+		// own target changes.
+		tagMu.Lock()
+		tr, ok := tagged[tag]
+		if !ok || tr.target != target {
+			if ok {
+				tr.conn.Close()
 			}
 			raddr, err := net.ResolveUDPAddr("udp", target)
 			if err != nil {
+				tagMu.Unlock()
 				continue
 			}
-			uc, err = net.DialUDP("udp", nil, raddr)
+			conn, err := net.DialUDP("udp", nil, raddr)
 			if err != nil {
-				uc = nil
+				tagMu.Unlock()
 				continue
 			}
-			curTarget = target
-			go m.udpReadLoop(ss, st, uc)
+			tr = &tagRelay{conn: conn, target: target}
+			tagged[tag] = tr
+			go m.udpReadLoopTagged(ss, st, conn, tag, func(c *net.UDPConn) {
+				tagMu.Lock()
+				if cur, ok := tagged[tag]; ok && cur.conn == c {
+					delete(tagged, tag)
+				}
+				tagMu.Unlock()
+			})
 		}
-		uc.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if _, err := uc.Write(data); err != nil {
+		conn := tr.conn
+		tagMu.Unlock()
+		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if _, err := conn.Write(data); err != nil {
 			return
 		}
 	}
@@ -1238,6 +1296,38 @@ func (m *mistService) udpReadLoop(ss *serverSession, st *mistcore.Stream, uc *ne
 			atyp, addr = mistcore.ATypIPv6, []byte(raddr.IP.To16())
 		}
 		dg := mistcore.EncodeDatagram(atyp, addr, uint16(raddr.Port), buf[:n])
+		if _, err := st.Write(dg); err != nil {
+			return
+		}
+	}
+}
+
+// udpReadLoopTagged is udpReadLoop for one tag: responses are re-encoded
+// with the same tag trailer, and on exit (timeout/error) its conn is
+// closed and removed from the relay map (only if still current).
+func (m *mistService) udpReadLoopTagged(ss *serverSession, st *mistcore.Stream, uc *net.UDPConn, tag byte, onExit func(*net.UDPConn)) {
+	defer func() {
+		uc.Close()
+		if onExit != nil {
+			onExit(uc)
+		}
+	}()
+	buf := make([]byte, 65535)
+	for {
+		uc.SetReadDeadline(time.Now().Add(120 * time.Second))
+		n, raddr, err := uc.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		ss.touch()
+		var atyp byte
+		var addr []byte
+		if ip4 := raddr.IP.To4(); ip4 != nil {
+			atyp, addr = mistcore.ATypIPv4, []byte(ip4)
+		} else {
+			atyp, addr = mistcore.ATypIPv6, []byte(raddr.IP.To16())
+		}
+		dg := mistcore.EncodeDatagramTagged(atyp, addr, uint16(raddr.Port), buf[:n], tag)
 		if _, err := st.Write(dg); err != nil {
 			return
 		}

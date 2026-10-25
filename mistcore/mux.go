@@ -96,6 +96,41 @@ func DecodeDatagram(p []byte) (atyp byte, addr []byte, port uint16, data []byte,
 	return atyp, addr, port, p[hdrLen+2 : hdrLen+2+dl], nil
 }
 
+// EncodeDatagramTagged builds a UDP relay datagram payload with an
+// optional per-session tag trailer. tag==0 encodes byte-identically to
+// EncodeDatagram (no trailer); tag!=0 appends "MT" + tag so the server
+// can demultiplex responses back to the right session. The trailer sits
+// past the declared data length, so an old DecodeDatagram ignores it
+// (old server forwards clean data; old client falls back to target
+// routing on a trailer-less response).
+func EncodeDatagramTagged(atyp byte, addr []byte, port uint16, data []byte, tag byte) []byte {
+	out := EncodeDatagram(atyp, addr, port, data)
+	if tag != 0 {
+		out = append(out, 0x4D, 0x54, tag)
+	}
+	return out
+}
+
+// DecodeDatagramTagged parses a UDP relay datagram payload like
+// DecodeDatagram, plus the optional tag trailer. A tag is recognised
+// only when exactly 3 bytes remain past the declared data and they are
+// "MT" + tag; any other trailer is ignored and tag is 0.
+func DecodeDatagramTagged(p []byte) (atyp byte, addr []byte, port uint16, data []byte, tag byte, err error) {
+	atyp, addr, port, data, err = DecodeDatagram(p)
+	if err != nil {
+		return 0, nil, 0, nil, 0, err
+	}
+	hdrLen := 1 + len(addr) + 2
+	if atyp == ATypDomain {
+		hdrLen++
+	}
+	trailer := p[hdrLen+2+len(data):]
+	if len(trailer) == 3 && trailer[0] == 0x4D && trailer[1] == 0x54 {
+		tag = trailer[2]
+	}
+	return atyp, addr, port, data, tag, nil
+}
+
 // BuildResumeMsg builds a RESUME control payload (SPEC 10.2).
 func BuildResumeMsg(connID [16]byte, tok [32]byte, newEpoch uint32) []byte {
 	out := make([]byte, 0, 57)
